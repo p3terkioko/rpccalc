@@ -7,10 +7,12 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h> // Added for inet_pton
 #include <fcntl.h>
 #include <time.h>
+#include <getopt.h> // Added for getopt_long
 
-#define PORT 8080
+// #define PORT 8080 // Will be set by command line argument
 #define MAX_EVENTS 10
 #define BUF_SIZE 1024
 
@@ -64,10 +66,59 @@ void handle_calculation(const char *input, char *response, size_t resp_size) {
     }
 }
 
-int main() {
+int main(int argc, char *argv[]) { // Added argc and argv
     int server_fd, client_fd, epoll_fd;
     struct sockaddr_in addr;
     struct epoll_event event, events[MAX_EVENTS];
+
+    char *gateway_host = NULL;
+    int gateway_port = -1;
+    char *my_host = NULL;
+    int my_port = -1;
+    char *server_name = NULL;
+
+    // Parse command line arguments
+    struct option long_options[] = {
+        {"gateway-host", required_argument, 0, 'g'},
+        {"gateway-port", required_argument, 0, 'p'},
+        {"my-host", required_argument, 0, 'h'},
+        {"my-port", required_argument, 0, 'm'},
+        {"server-name", required_argument, 0, 's'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "g:p:h:m:s:", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'g':
+                gateway_host = optarg;
+                break;
+            case 'p':
+                gateway_port = atoi(optarg);
+                break;
+            case 'h':
+                my_host = optarg;
+                break;
+            case 'm':
+                my_port = atoi(optarg);
+                break;
+            case 's':
+                server_name = optarg;
+                break;
+            default:
+                fprintf(stderr, "Usage: %s --gateway-host <host> --gateway-port <port> --my-host <host> --my-port <port> --server-name <name>\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    if (!gateway_host || gateway_port == -1 || !my_host || my_port == -1 || !server_name) {
+        fprintf(stderr, "Missing required arguments.\n");
+        fprintf(stderr, "Usage: %s --gateway-host <host> --gateway-port <port> --my-host <host> --my-port <port> --server-name <name>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    log_with_timestamp("Server starting with provided arguments.");
+
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -78,16 +129,67 @@ int main() {
     set_nonblocking(server_fd);
 
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(my_port); // Use my_port from command line
+    // addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces initially
+                                        // For registration, my_host is used.
+    if (inet_pton(AF_INET, my_host, &addr.sin_addr) <= 0) {
+        perror("Invalid address/ Address not supported");
+        // We might want to allow INADDR_ANY for listening, but use specific my_host for registration.
+        // For now, let's assume my_host is the listen IP.
+        log_with_timestamp("Using INADDR_ANY for listening due to my_host issue for bind.");
+        addr.sin_addr.s_addr = INADDR_ANY; // Fallback or specific configuration needed
+    }
+
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("Bind failed");
-        exit(EXIT_FAILURE);
+        // If specific my_host bind fails, try INADDR_ANY as a fallback for listening
+        log_with_timestamp("Bind to specific my_host failed, trying INADDR_ANY.");
+        addr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("Bind failed on INADDR_ANY as well");
+            exit(EXIT_FAILURE);
+        }
     }
 
     listen(server_fd, SOMAXCONN);
-    log_with_timestamp("TCP server listening...");
+    char log_msg[256];
+    snprintf(log_msg, sizeof(log_msg), "TCP server listening on %s:%d...", my_host, my_port);
+    log_with_timestamp(log_msg);
+
+    // Register with gateway
+    int reg_sock;
+    struct sockaddr_in gateway_addr;
+    char reg_msg[512];
+
+    snprintf(reg_msg, sizeof(reg_msg), "type=TCP;host=%s;port=%d;name=%s;ops=add,subtract,multiply,divide",
+             my_host, my_port, server_name);
+
+    if ((reg_sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("UDP socket creation for registration failed");
+        // Continue without registration? Or exit? For now, log and continue.
+    } else {
+        memset(&gateway_addr, 0, sizeof(gateway_addr));
+        gateway_addr.sin_family = AF_INET;
+        gateway_addr.sin_port = htons(gateway_port);
+
+        if (inet_pton(AF_INET, gateway_host, &gateway_addr.sin_addr) <= 0) {
+            perror("Invalid gateway address for registration");
+            close(reg_sock); // Close the created socket
+        } else {
+            log_with_timestamp("Attempting to register with gateway...");
+            if (sendto(reg_sock, reg_msg, strlen(reg_msg), 0, (const struct sockaddr *)&gateway_addr, sizeof(gateway_addr)) < 0) {
+                perror("sendto registration message failed");
+                char error_log[512];
+                snprintf(error_log, sizeof(error_log), "Failed to send registration to %s:%d. Error: %s", gateway_host, gateway_port, strerror(errno));
+                log_with_timestamp(error_log);
+            } else {
+                snprintf(log_msg, sizeof(log_msg), "Registration message sent to %s:%d: %s", gateway_host, gateway_port, reg_msg);
+                log_with_timestamp(log_msg);
+            }
+            close(reg_sock);
+        }
+    }
 
     epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {

@@ -855,13 +855,21 @@ int main() {
                                 int parse_res_status = parse_backend_response(backend_response_str, &backend_result, backend_error_msg, sizeof(backend_error_msg));
 
                                 if (parse_res_status == 0) {
+                                    // Success: include backend info in the result
+                                    snprintf(response_str, sizeof(response_str),
+                                        "{\"jsonrpc\": \"2.0\", \"result\": {\"value\": %.10g, \"backend\": \"%s (%s:%d)\"}, \"id\": %d}",
+                                        backend_result, selected_backend->name, selected_backend->host, selected_backend->port, id);
+                                    snprintf(log_buf, sizeof(log_buf), "Sending JSON-RPC response (id: %d): %s", id, response_str);
+                                    log_with_timestamp("DEBUG", log_buf);
+                                    write(client_fd, response_str, strlen(response_str));
                                 } else if (parse_res_status == 1) {
-                                    final_error_message_ptr = backend_error_msg;
+                                    build_json_rpc_response(response_str, id, 0.0, backend_error_msg);
+                                    write(client_fd, response_str, strlen(response_str));
                                 } else {
                                     final_error_message_ptr = backend_error_msg;
                                 }
                             }
-                            build_json_rpc_response(response_str, id, backend_result, final_error_message_ptr);
+                            build_json_rpc_response(response_str, id, 0.0, final_error_message_ptr);
                         } else {
                              build_json_rpc_response(response_str, id, 0.0, error_message);
                         }
